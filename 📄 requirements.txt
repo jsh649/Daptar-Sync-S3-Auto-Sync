@@ -1,0 +1,5 @@
+boto3>=1.28
+pystray>=0.19
+Pillow>=10.0
+cryptography>=41.0
+watchdog>=3.0
