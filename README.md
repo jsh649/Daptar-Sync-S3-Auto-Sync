@@ -1,15 +1,17 @@
+<p align="center">
+  <img src="screenshot.png" alt="Daptar Sync" width="700">
+</p>
 
 <div dir="rtl">
-
 # 🔄 Daptar Sync — همگام‌ساز خودکار S3
+</div>
 
 [![Version](https://img.shields.io/badge/version-1.0.2.0-blue)]()
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey)]()
 [![Python](https://img.shields.io/badge/python-3.9%2B-green)]()
-[![License](https://img.shields.io/badge/license-MIT-orange)]()
-
+<div dir="rtl">
 **Daptar Sync** یک ابزار سبک، پرتابل و رایگان برای همگام‌سازی خودکار پوشه‌ها با هر فضای ابری سازگار با S3 است — بدون نیاز به نصب، بدون وابستگی به سرویس خاص.
-
+</div>
 > 🇬🇧 [English documentation below](#-daptar-sync--automatic-s3-sync-tool)
 
 ---
@@ -114,7 +116,7 @@ python -m PyInstaller --windowed --onedir --name DaptarSync daptar_sync.py
 | همگام‌سازی مدام اجرا می‌شود | فایل‌های موقت را به الگوهای صرف‌نظر اضافه کن (`~$*`, `*.tmp`, ...) |
 
 ---
-
+</div>
 <div align="center">
 
 ساخته‌شده با ❤️ و Python
@@ -238,13 +240,3 @@ python -m PyInstaller --windowed --onedir --name DaptarSync daptar_sync.py
 
 Made with ❤️ and Python
 
-</div>
-```` `YOUR-USERNAME` را (در دو بلوک git clone) با نام کاربری GitHub خودت عوض کن.
-
-اگر خواستی اسکرین‌شات برنامه هم زیر عنوان اصلی قرار بگیرد، این دو خط را بعد از بج‌ها اضافه کن:
-
-```markdown
-<p align="center">
-  <img src="screenshot.png" alt="Daptar Sync" width="700">
-</p>
-```
