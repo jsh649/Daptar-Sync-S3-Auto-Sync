@@ -53,8 +53,7 @@ set "OLD_INDEX_URL=%PIP_INDEX_URL%"
 set "OLD_TRUSTED_HOST=%PIP_TRUSTED_HOST%"
 
 REM ============================================================
-REM  Helper: try to install a package using a chain of indexes
-REM  Arguments: %1 = package name
+REM  Install PyInstaller (chain of mirrors)
 REM ============================================================
 set "INSTALLED_OK=0"
 
@@ -136,6 +135,8 @@ echo.
 
 REM ============================================================
 REM  Verify / install other required libraries
+REM  (watchdog is REQUIRED for instant file-change sync;
+REM   without it the app falls back to 20s periodic scanning)
 REM ============================================================
 echo [INFO] Verifying required libraries...
 set MISSING=
@@ -143,6 +144,7 @@ python -c "import boto3" 2>nul || set MISSING=!MISSING! boto3
 python -c "import pystray" 2>nul || set MISSING=!MISSING! pystray
 python -c "from PIL import Image" 2>nul || set MISSING=!MISSING! Pillow
 python -c "from cryptography.fernet import Fernet" 2>nul || set MISSING=!MISSING! cryptography
+python -c "import watchdog" 2>nul || set MISSING=!MISSING! watchdog
 
 if defined MISSING (
     echo [INFO] Missing:!MISSING!
@@ -154,6 +156,7 @@ if defined MISSING (
     python -c "import pystray" 2>nul || set MISSING=!MISSING! pystray
     python -c "from PIL import Image" 2>nul || set MISSING=!MISSING! Pillow
     python -c "from cryptography.fernet import Fernet" 2>nul || set MISSING=!MISSING! cryptography
+    python -c "import watchdog" 2>nul || set MISSING=!MISSING! watchdog
 
     if defined MISSING (
         echo [INFO] Retrying missing libraries via Runflare mirror...
@@ -167,11 +170,15 @@ if defined MISSING (
         python -c "import pystray" 2>nul || set MISSING=!MISSING! pystray
         python -c "from PIL import Image" 2>nul || set MISSING=!MISSING! Pillow
         python -c "from cryptography.fernet import Fernet" 2>nul || set MISSING=!MISSING! cryptography
+        python -c "import watchdog" 2>nul || set MISSING=!MISSING! watchdog
     )
 
     if defined MISSING (
         echo [ERROR] Still missing after all attempts:!MISSING!
-        goto :cleanup_and_exit
+        echo.
+        echo   NOTE: if only "watchdog" is missing, the build can still
+        echo   proceed, but instant sync will be disabled in the EXE.
+        echo.
     )
 )
 echo       All required libraries are present.
@@ -214,11 +221,13 @@ python -m PyInstaller ^
     --name "DaptarSync" ^
     --hidden-import "pystray._win32" ^
     --hidden-import "PIL._tkinter_finder" ^
+    --hidden-import "watchdog.observers.read_directory_changes" ^
     --collect-all "pystray" ^
     --collect-all "PIL" ^
     --collect-all "boto3" ^
     --collect-all "botocore" ^
     --collect-all "cryptography" ^
+    --collect-all "watchdog" ^
     %ICON_OPT% ^
     %DATA_OPT% ^
     daptar_sync.py
@@ -228,6 +237,24 @@ if errorlevel 1 (
     echo [ERROR] Build failed.
     goto :cleanup_and_exit
 )
+
+REM ============================================================
+REM  Verify watchdog got bundled (instant sync feature)
+REM ============================================================
+set WATCHDOG_BUNDLED=0
+if exist "dist\DaptarSync\_internal\watchdog" set WATCHDOG_BUNDLED=1
+if exist "dist\DaptarSync\watchdog" set WATCHDOG_BUNDLED=1
+
+echo.
+if "%WATCHDOG_BUNDLED%"=="1" (
+    echo [OK]   watchdog bundled - instant file-change sync ENABLED.
+) else (
+    echo [WARN] watchdog NOT found in build output!
+    echo        The app will fall back to 20-second periodic scanning.
+    echo        Fix: install watchdog on THIS machine and rebuild:
+    echo            python -m pip install watchdog
+)
+echo.
 
 REM ============================================================
 REM  Post-build artifacts
@@ -255,13 +282,15 @@ if exist "icon.png" (
     echo   4. Click "Start Auto Sync" and optionally enable
     echo      "Run automatically with Windows".
     echo.
-    echo FILES CREATED ON FIRST RUN:
-    echo   - secret.key       ^(encryption key - DO NOT DELETE^)
+    echo FILES CREATED ON FIRST RUN ^(in %%APPDATA%%\DaptarSync^):
     echo   - config.enc       ^(encrypted settings^)
-    echo   - daptarsync.log   ^(log file^)
+    echo   - secret.key       ^(encryption key - DO NOT DELETE^)
+    echo   - daptarsync.log   ^(rotating log file^)
     echo.
-    echo IMPORTANT:
-    echo   - If you move the folder to another path, uncheck and
+    echo NOTES:
+    echo   - Settings are stored per Windows user in %%APPDATA%%,
+    echo     so no admin rights are needed to save settings.
+    echo   - If you move this folder to another path, uncheck and
     echo     re-check "Run automatically with Windows" so the
     echo     startup shortcut points to the new location.
     echo   - Windows SmartScreen may warn on first run. Click
