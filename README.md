@@ -35,14 +35,6 @@
 
 ---
 
-## 📥 نصب (نسخه آماده — برای کاربر عادی)
-
-1. فایل زیپ `DaptarSync.zip` را از بخش [Releases](../../releases) دانلود کن.
-2. کل پوشه را در هر مسیری Extract کن (مثلاً `D:\Tools\DaptarSync`).
-3. `DaptarSync.exe` را اجرا کن.
-4. اطلاعات اتصال را وارد کن → **ذخیره تنظیمات** → **شروع خودکار**.
-5. در صورت هشدار SmartScreen: **More info → Run anyway**.
-
 ### تنظیمات اتصال
 
 | فیلد | توضیح | مثال (ابر آروان) |
@@ -153,14 +145,6 @@ A lightweight, **portable** Windows application for automatic folder synchroniza
 - 🔒 **Single instance:** only one copy runs at a time
 
 ---
-
-## 📥 Installation (Ready-made build)
-
-1. Download `DaptarSync.zip` from [Releases](../../releases).
-2. Extract the folder anywhere (e.g. `D:\Tools\DaptarSync`).
-3. Run `DaptarSync.exe`.
-4. Enter your connection details → **Save Settings** → **Start Auto Sync**.
-5. If SmartScreen warns: **More info → Run anyway**.
 
 ### Connection settings
 
