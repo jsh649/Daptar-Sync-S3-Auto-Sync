@@ -38,7 +38,7 @@ except Exception:
     WATCHDOG_OK = False
 
 APP_NAME = "Daptar Sync"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.3.0"
 APP_ID = "DaptarSync"
 TRAY_ARG = '--tray'
 
@@ -52,10 +52,14 @@ LOCK_TTL = 20 * 60
 LOCK_REFRESH = 4 * 60
 LOCK_PORT = 51724
 DEBOUNCE_SEC = 5
-POLL_FALLBACK_SEC = 20              # اسکن دوره‌ای وقتی watchdog موجود نیست
+POLL_FALLBACK_SEC = 20
 
-DEFAULT_IGNORES = ('_gsdata_, .sync, .daptar, *.tmp, ~$*, *.part, *.crdownload, '
-                   '*.daptar.part, Thumbs.db, desktop.ini, .DS_Store')
+# فایل‌های دیتابیس زنده (mdf/ldf/ndf) همگام‌سازی فایلی برایشان خطرناک است؛
+# اگر می‌خواهید حتماً همگام شوند، از فیلد الگوها در تنظیمات حذفشان کنید.
+DEFAULT_IGNORES = ('_gsdata_, .sync, .daptar, .recycle_bin, *.tmp, ~$*, *.part, '
+                   '*.crdownload, *.daptar.part, Thumbs.db, desktop.ini, .DS_Store, '
+                   '*.mdf, *.ldf, *.ndf')
+IGNORE_DEFAULTS_VERSION = 2
 
 DIRECTION_LABELS = {
     'bidirectional': 'دومسیره',
@@ -356,6 +360,25 @@ def migrate_legacy_files():
     except Exception as e:
         log(f"خطا در انتقال تنظیمات قدیمی: {e}", 'warning')
 
+def upgrade_ignore_patterns(config):
+    """الگوهای پیش‌فرضِ جاافتاده را یک‌بار به تنظیمات قدیمی اضافه می‌کند
+    (مثلاً .sync و _gsdata_ و *.mdf که در تنظیمات نسخه‌های قبلی نبودند)."""
+    if not isinstance(config, dict) or config.get('ignore_defaults_v', 0) >= IGNORE_DEFAULTS_VERSION:
+        return
+    raw = (config.get('ignore_patterns') or '').strip()
+    pats = [p.strip() for p in raw.split(',') if p.strip()]
+    added = []
+    for d in DEFAULT_IGNORES.split(','):
+        d = d.strip()
+        if d and d not in pats:
+            pats.append(d)
+            added.append(d)
+    config['ignore_patterns'] = ', '.join(pats)
+    config['ignore_defaults_v'] = IGNORE_DEFAULTS_VERSION
+    save_config(config)
+    if added:
+        log("الگوهای نادیده‌گرفتن استاندارد به تنظیمات اضافه شد: " + ', '.join(added))
+
 # ================== الگوهای نادیده‌گرفتن ==================
 def build_ignore_patterns(config):
     raw = config.get('ignore_patterns')
@@ -382,6 +405,13 @@ TRANSFER_CFG = TransferConfig(
     multipart_chunksize=8 * 1024 * 1024,
     max_concurrency=2,
     use_threads=True,
+)
+
+# برای تلاش مجدد وقتی آپلود چندبخشی به‌خاطر تغییر فایل هنگام انتقال شکست خورده
+SINGLE_PART_CFG = TransferConfig(
+    multipart_threshold=64 * 1024 * 1024 * 1024,
+    max_concurrency=1,
+    use_threads=False,
 )
 
 def create_s3_client(config):
@@ -487,17 +517,37 @@ def list_s3_objects(s3, bucket, patterns=(), lock=None):
 
 # ================== عملیات ==================
 def safe_upload(s3, bucket, local_path, key):
+    # فایل‌های قفل‌شده (مانند دیتابیس باز) سریع رد می‌شوند تا سیکل قفل نشود
+    try:
+        with open(local_path, 'rb') as f:
+            f.read(1)
+    except PermissionError:
+        log(f"رد شد (فایل در استفادهٔ انحصاری برنامهٔ دیگر است): {key}", 'warning')
+        return False, None
+    except OSError as e:
+        log(f"خطا در خواندن {key}: {e}", 'error')
+        return False, None
+
     try:
         s3.upload_file(local_path, bucket, key, Config=TRANSFER_CFG)
-        try:
-            rmt = s3.head_object(Bucket=bucket, Key=key)['LastModified'].timestamp()
-        except Exception:
-            rmt = time.time()
-        log(f"آپلود: {key}")
-        return True, rmt
     except Exception as e:
-        log(f"خطا در آپلود {key}: {e}", 'error')
-        return False, None
+        if 'NoSuchUpload' in str(e):
+            # احتمالاً فایل هنگام آپلود چندبخشی تغییر کرده — یک‌بار تکی امتحان کن
+            log(f"تلاش مجدد بدون multipart (فایل هنگام انتقال تغییر کرد): {key}", 'warning')
+            try:
+                s3.upload_file(local_path, bucket, key, Config=SINGLE_PART_CFG)
+            except Exception as e2:
+                log(f"خطا در آپلود {key}: {e2}", 'error')
+                return False, None
+        else:
+            log(f"خطا در آپلود {key}: {e}", 'error')
+            return False, None
+    try:
+        rmt = s3.head_object(Bucket=bucket, Key=key)['LastModified'].timestamp()
+    except Exception:
+        rmt = time.time()
+    log(f"آپلود: {key}")
+    return True, rmt
 
 def safe_download(s3, bucket, key, local_path):
     """دانلود اتمیک: اول فایل موقت، بعد جایگزینی — فایل اصلی هرگز نیمه‌کاره نمی‌شود."""
@@ -511,6 +561,14 @@ def safe_download(s3, bucket, key, local_path):
         lmt = os.stat(local_path).st_mtime
         log(f"دانلود: {key}")
         return True, lmt
+    except PermissionError:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        log(f"رد شد (فایل مقصد در استفادهٔ برنامهٔ دیگر است): {key}", 'warning')
+        return False, None
     except Exception as e:
         try:
             if os.path.exists(tmp):
@@ -532,6 +590,23 @@ def safe_create_folder_marker(s3, bucket, key):
     except Exception as e:
         log(f"خطا در ساخت نشانگر {key}: {e}", 'error')
         return False, None
+
+def safe_server_move(s3, bucket, src_key, dst_key):
+    """تغییر نام سمت سرور: کپی + انتقال نسخهٔ قدیمی به بازیافت — بدون آپلود مجدد."""
+    try:
+        s3.copy_object(Bucket=bucket,
+                       CopySource={'Bucket': bucket, 'Key': src_key},
+                       Key=dst_key)
+    except Exception as e:
+        log(f"خطا در کپی سمت سرور {src_key} → {dst_key}: {e}", 'warning')
+        return False, None
+    try:
+        rmt = s3.head_object(Bucket=bucket, Key=dst_key)['LastModified'].timestamp()
+    except Exception:
+        rmt = time.time()
+    move_s3_to_recycle(s3, bucket, src_key)
+    log(f"تغییر نام (انتقال سمت سرور): {src_key} → {dst_key}")
+    return True, rmt
 
 def move_local_to_recycle(local_folder, rel_path):
     full_path = os.path.join(local_folder, rel_path.rstrip('/'))
@@ -676,42 +751,63 @@ def _execute_action(s3, bucket, local_folder, act):
         if act.get('recycle_remote_first'):
             move_s3_to_recycle(s3, bucket, key)
         ok, rmt = safe_upload(s3, bucket, act['path'], key)
-        return (key, 'upload', ok, act.get('lm', 0), rmt)
+        return {'key': key, 'kind': 'upload', 'ok': ok,
+                'lm': act.get('lm', 0), 'rm': rmt}
     if op == 'download':
         if act.get('recycle_local_first'):
             move_local_to_recycle(local_folder, key)
         ok, lmt = safe_download(s3, bucket, key, act['path'])
-        return (key, 'download', ok, lmt, act.get('rm', 0))
+        return {'key': key, 'kind': 'download', 'ok': ok,
+                'lm': lmt, 'rm': act.get('rm', 0)}
     if op == 'marker':
         ok, rmt = safe_create_folder_marker(s3, bucket, key)
-        return (key, 'marker', ok, 0, rmt)
+        return {'key': key, 'kind': 'marker', 'ok': ok, 'lm': 0, 'rm': rmt}
+    if op == 'server_move_file':
+        ok, rmt = safe_server_move(s3, bucket, act['src'], key)
+        if ok:
+            return {'key': key, 'kind': 'server_move', 'ok': True,
+                    'lm': act.get('lm', 0), 'rm': rmt, 'src': act['src']}
+        # کپی سمت سرور نشد → مثل حالت عادی: آپلود نسخهٔ جدید + بازیافت قدیمی
+        ok2, rmt2 = safe_upload(s3, bucket, act['path'], key)
+        if ok2:
+            move_s3_to_recycle(s3, bucket, act['src'])
+        return {'key': key, 'kind': 'upload', 'ok': ok2,
+                'lm': act.get('lm', 0), 'rm': rmt2, 'src': act['src']}
+    if op == 'server_move_marker':
+        ok, rmt = safe_create_folder_marker(s3, bucket, key)
+        if ok:
+            move_s3_to_recycle(s3, bucket, act['src'])
+        return {'key': key, 'kind': 'server_move', 'ok': ok,
+                'lm': 0, 'rm': rmt, 'src': act['src']}
     if op == 'mkdir':
         try:
             os.makedirs(act['path'], exist_ok=True)
             log(f"پوشه: {key}")
-            return (key, 'mkdir', True, 0, act.get('rm', 0))
+            return {'key': key, 'kind': 'mkdir', 'ok': True,
+                    'lm': 0, 'rm': act.get('rm', 0)}
         except OSError as e:
             log(f"خطا در ساخت پوشه {key}: {e}", 'error')
-            return (key, 'mkdir', False, None, None)
+            return {'key': key, 'kind': 'mkdir', 'ok': False, 'lm': None, 'rm': None}
     if op == 'recycle_local':
         ok = move_local_to_recycle(local_folder, key)
-        return (key, 'recycle_local', ok, None, None)
+        return {'key': key, 'kind': 'recycle_local', 'ok': ok, 'lm': None, 'rm': None}
     if op == 'recycle_remote':
         ok = move_s3_to_recycle(s3, bucket, key)
-        return (key, 'recycle_remote', ok, None, None)
-    return (key, 'unknown', False, None, None)
+        return {'key': key, 'kind': 'recycle_remote', 'ok': ok, 'lm': None, 'rm': None}
+    return {'key': key, 'kind': 'unknown', 'ok': False, 'lm': None, 'rm': None}
 
 # ================== همگام‌سازی ==================
 progress_callback = None
 
 def sync(config, stop=None):
     """
-    الگوریتم مبتنی بر state (نسخهٔ ۲):
-    تغییر هر طرف نسبت به «آخرین وضعیت ثبت‌شدهٔ همان ماشین» سنجیده می‌شود؛
-    هرگز زمان محلی مستقیماً با زمان سرور مقایسه نمی‌شود.
+    الگوریتم مبتنی بر state (نسخهٔ ۲) + تشخیص تغییر نام:
+    - تغییر هر طرف نسبت به «آخرین وضعیت ثبت‌شدهٔ همان ماشین» سنجیده می‌شود.
+    - فایل‌های تغییرنام‌یافته (نام فایل + حجم یکسان، و در حالت عادی mtime نیز برابر)
+      با «انتقال سمت سرور» جابه‌جا می‌شوند — نه دانلود مجدد نسخهٔ قدیمی.
     """
     stop = stop if stop is not None else threading.Event()
-    summary = {'uploads': 0, 'downloads': 0, 'folders': 0,
+    summary = {'uploads': 0, 'downloads': 0, 'folders': 0, 'renames': 0,
                'recycled_local': 0, 'recycled_remote': 0, 'conflicts': 0,
                'stopped': False, 'error': False, 'locked': False}
 
@@ -769,8 +865,51 @@ def sync(config, stop=None):
             except Exception:
                 log("خواندن state ناموفق — بازسازی بدون حذف.", 'warning')
         if first_run:
-            log("اجرای اول / بازسازی state — فقط انتقال؛ تعارض محتوایی: نسخهٔ جدیدتر برنده "
-                "و قدیمی‌تر به بازیافت می‌رود.")
+            log("اجرای اول / بازسازی state — تغییر نام‌ها تشخیص داده می‌شوند؛ "
+                "تعارض محتوایی: نسخهٔ جدیدتر برنده و قدیمی‌تر به بازیافت می‌رود.")
+
+        # ============ تشخیص تغییر نام (رفع باگ «دو پوشه شدن») ============
+        rename_pairs = []
+        renamed_old = set()
+        renamed_new = set()
+        if not stop.is_set():
+            # فایل‌ها: جفت‌سازی بر اساس نام فایل + حجم (و mtime در حالت عادی)
+            ridx = {}
+            for rk, rv in remote_files.items():
+                if rk in local_files or rv.get('is_dir'):
+                    continue
+                ridx.setdefault((rk.rsplit('/', 1)[-1], rv['size']), []).append(rk)
+            for lk, lv in local_files.items():
+                if lk in remote_files or lv.get('is_dir'):
+                    continue
+                cands = [c for c in ridx.get((lk.rsplit('/', 1)[-1], lv['size']), [])
+                         if c not in renamed_old]
+                if not cands:
+                    continue
+                rk = cands[0]
+                if not first_run:
+                    P_old = state.get(rk)
+                    if not P_old or P_old.get('local_mtime') is None:
+                        continue   # فایل قدیمی قبلاً محلی نبوده
+                    if abs(lv['mtime'] - (P_old.get('local_mtime') or 0)) > 2:
+                        continue   # mtime متفاوت → تغییر نام همراه با ویرایش
+                    P_new = state.get(lk)
+                    if P_new and P_new.get('remote_mtime') is not None:
+                        continue
+                renamed_old.add(rk)
+                renamed_new.add(lk)
+                rename_pairs.append((rk, lk))
+            # نشانگر پوشه‌های خالی: جفت‌سازی بر اساس تعداد
+            lm_only = sorted(k for k, v in local_files.items()
+                             if v.get('is_dir') and k not in remote_files)
+            rm_only = sorted(k for k, v in remote_files.items()
+                             if v.get('is_dir') and k not in local_files)
+            for rk, lk in zip(rm_only, lm_only):
+                renamed_old.add(rk)
+                renamed_new.add(lk)
+                rename_pairs.append((rk, lk))
+        if rename_pairs:
+            log(f"{len(rename_pairs)} مورد تغییر نام شناسایی شد — انتقال سمت سرور...")
 
         # ================= فاز ۱: تصمیم‌گیری =================
         actions = []
@@ -786,6 +925,9 @@ def sync(config, stop=None):
             handled.append(key)
             if progress_callback and (i % step == 0 or i == total):
                 progress_callback('مقایسه', i, total)
+
+            if key in renamed_old or key in renamed_new:
+                continue   # در فاز تشخیص تغییر نام پردازش شده
 
             L = local_files.get(key)
             R = remote_files.get(key)
@@ -888,6 +1030,17 @@ def sync(config, stop=None):
                         actions.append({'op': 'download', 'key': key, 'path': lpath,
                                         'lm': 0, 'rm': R['mtime']})
 
+        # عملیات تغییر نام
+        for old_k, new_k in rename_pairs:
+            if stop.is_set():
+                break
+            if remote_files[old_k].get('is_dir'):
+                actions.append({'op': 'server_move_marker', 'key': new_k, 'src': old_k})
+            else:
+                actions.append({'op': 'server_move_file', 'key': new_k, 'src': old_k,
+                                'path': local_files[new_k]['full_path'],
+                                'lm': local_files[new_k]['mtime']})
+
         # ================= فاز ۲: اجرای موازی =================
         updated = {}
         removed = set()
@@ -902,7 +1055,8 @@ def sync(config, stop=None):
                     return _execute_action(s3, bucket, local_folder, act)
                 except Exception as e:
                     log(f"خطای غیرمنتظره در عملیات {act.get('key')}: {e}", 'error')
-                    return (act['key'], 'error', False, None, None)
+                    return {'key': act.get('key'), 'kind': 'error',
+                            'ok': False, 'lm': None, 'rm': None}
 
             done = 0
             with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -917,18 +1071,32 @@ def sync(config, stop=None):
                         if res is None:
                             summary['stopped'] = True
                             continue
-                        key, kind, ok, v1, v2 = res
-                        if not ok:
+                        if not res.get('ok'):
                             continue
+                        key = res['key']
+                        kind = res['kind']
                         if kind == 'upload':
                             summary['uploads'] += 1
-                            updated[key] = {'local_mtime': v1, 'remote_mtime': v2}
+                            updated[key] = {'local_mtime': res['lm'],
+                                            'remote_mtime': res['rm']}
+                            if res.get('src'):
+                                removed.add(res['src'])
                         elif kind == 'download':
                             summary['downloads'] += 1
-                            updated[key] = {'local_mtime': v1, 'remote_mtime': v2}
-                        elif kind in ('marker', 'mkdir'):
+                            updated[key] = {'local_mtime': res['lm'],
+                                            'remote_mtime': res['rm']}
+                        elif kind == 'marker':
                             summary['folders'] += 1
-                            updated[key] = {'local_mtime': 0, 'remote_mtime': v2}
+                            updated[key] = {'local_mtime': 0, 'remote_mtime': res['rm']}
+                        elif kind == 'mkdir':
+                            summary['folders'] += 1
+                            updated[key] = {'local_mtime': 0, 'remote_mtime': res['rm']}
+                        elif kind == 'server_move':
+                            summary['renames'] += 1
+                            updated[key] = {'local_mtime': res['lm'],
+                                            'remote_mtime': res['rm']}
+                            if res.get('src'):
+                                removed.add(res['src'])
                         elif kind == 'recycle_local':
                             summary['recycled_local'] += 1
                             removed.add(key)
@@ -972,7 +1140,8 @@ def sync(config, stop=None):
 
         if not summary['stopped'] and not summary['error']:
             log(f"=== پایان ({time.time() - t0:.0f}s): {summary['uploads']} آپلود، "
-                f"{summary['downloads']} دانلود، {summary['folders']} پوشه، "
+                f"{summary['downloads']} دانلود، {summary['renames']} تغییر نام، "
+                f"{summary['folders']} پوشه، "
                 f"{summary['recycled_local'] + summary['recycled_remote']} بازیافت، "
                 f"{summary['conflicts']} تعارض ===", 'success')
     except Exception as e:
@@ -1030,6 +1199,7 @@ class SyncApp:
             pass
 
         self.config = load_config()
+        upgrade_ignore_patterns(self.config)   # افزودن الگوهای جاافتاده (یک‌بار)
         self.auto_sync = False
         self.auto_thread = None
         self.sync_thread = None
@@ -1091,15 +1261,11 @@ class SyncApp:
         self.entry_access.grid(row=1, column=1, columnspan=2, sticky=tk.EW, pady=3, padx=(5, 0))
         add_entry_shortcuts(self.entry_access)
 
+        # Secret Key — همیشه مخفی (بازخورد کاربر)
         ttk.Label(form, text="Secret Key:").grid(row=2, column=0, sticky=tk.W, pady=3)
-        sf = ttk.Frame(form)
-        sf.grid(row=2, column=1, columnspan=2, sticky=tk.EW, pady=3, padx=(5, 0))
-        self.entry_secret = ttk.Entry(sf, show="•")
-        self.entry_secret.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.entry_secret = ttk.Entry(form, show="•")
+        self.entry_secret.grid(row=2, column=1, columnspan=2, sticky=tk.EW, pady=3, padx=(5, 0))
         add_entry_shortcuts(self.entry_secret)
-        self.var_show_secret = tk.BooleanVar(value=False)
-        ttk.Checkbutton(sf, text="نمایش", variable=self.var_show_secret,
-                        command=self._toggle_secret).pack(side=tk.LEFT, padx=(6, 0))
 
         ttk.Label(form, text="نام باکت:").grid(row=3, column=0, sticky=tk.W, pady=3)
         self.entry_bucket = ttk.Entry(form)
@@ -1180,9 +1346,6 @@ class SyncApp:
         add_entry_shortcuts(self.log_text)
         for tag, color in (('error', '#c62828'), ('warning', '#e65100'), ('success', '#2e7d32')):
             self.log_text.tag_config(tag, foreground=color)
-
-    def _toggle_secret(self):
-        self.entry_secret.config(show="" if self.var_show_secret.get() else "•")
 
     # ---------- پمپ UI: تنها نقطهٔ مجاز دستکاری ویجت‌ها ----------
     def call_in_main(self, fn):
@@ -1313,7 +1476,9 @@ class SyncApp:
             par = int(self.entry_parallel.get() or 3)
         except ValueError:
             par = 3
-        return {
+        # کلیدهای سیستمی (مثل ignore_defaults_v) حفظ می‌شوند
+        cfg = dict(self.config or {})
+        cfg.update({
             'endpoint': self.entry_endpoint.get().strip(),
             'access_key': self.entry_access.get().strip(),
             'secret_key': self.entry_secret.get().strip(),
@@ -1326,7 +1491,8 @@ class SyncApp:
             'instant': self.var_instant.get(),
             'autostart': self.var_autostart.get(),
             'auto_sync': self.auto_sync,
-        }
+        })
+        return cfg
 
     def save_settings(self):
         prev_folder = self.config.get('local_folder')
@@ -1433,6 +1599,7 @@ class SyncApp:
                 self._last_sync_text = (
                     f"{datetime.datetime.now():%H:%M:%S} — "
                     f"{result['uploads']}↑ {result['downloads']}↓ "
+                    f"{result.get('renames', 0)}⟷ "
                     f"{result['recycled_local'] + result['recycled_remote']}↩")
                 self.root.after(2500, self._reset_progress)
             self._set_tray_title(self._last_sync_text)
@@ -1532,8 +1699,7 @@ class SyncApp:
             self.start_auto()
 
     def _auto_loop(self, token):
-        """زمان‌بندی پویا: تغییر «فاصله زمانی» در تنظیمات ظرف ~۱ ثانیه اعمال می‌شود.
-        توکن جلوی هم‌زمانی دو حلقه (توقف/شروع سریع) را می‌گیرد."""
+        """زمان‌بندی پویا: تغییر «فاصله زمانی» در تنظیمات ظرف ~۱ ثانیه اعمال می‌شود."""
         try:
             while self.auto_sync and self._auto_token == token:
                 self._next_sync_at = None
